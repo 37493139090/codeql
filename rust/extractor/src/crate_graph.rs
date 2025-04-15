@@ -956,7 +956,6 @@ fn scalar_to_str(scalar: &Scalar) -> &'static str {
 }
 
 fn make_path(db: &dyn HirDatabase, item: impl HasModule) -> Vec<String> {
-    let db = db;
     let module = item.module(db);
     make_path_mod(db, module)
 }
