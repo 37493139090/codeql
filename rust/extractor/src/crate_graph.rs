@@ -13,8 +13,8 @@ use ra_ap_hir::{DefMap, ModuleDefId, PathKind, db::HirDatabase};
 use ra_ap_hir::{VariantId, Visibility, db::DefDatabase};
 use ra_ap_hir_def::Lookup;
 use ra_ap_hir_def::{
-    AssocItemId, LocalModuleId, data::adt::VariantData, item_scope::ImportOrGlob,
-    item_tree::ImportKind, nameres::ModuleData, path::ImportAlias,
+    AssocItemId, LocalModuleId, item_scope::ImportOrGlob, item_tree::ImportKind,
+    nameres::ModuleData,
 };
 use ra_ap_hir_def::{HasModule, visibility::VisibilityExplicitness};
 use ra_ap_hir_def::{ModuleId, resolver::HasResolver};
@@ -27,8 +27,8 @@ use ra_ap_hir_ty::{TraitRefExt, from_assoc_type_id};
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_vfs::{Vfs, VfsPath};
 
-use ra_ap_hir_def::data::ConstFlags;
-use ra_ap_hir_def::item_tree::StaticFlags;
+use ra_ap_hir_def::item_tree::{FieldsShape, ImportAlias};
+use ra_ap_hir_def::signatures::{ConstFlags, StaticFlags};
 use ra_ap_hir_ty::db::InternedCallableDefId;
 use std::hash::Hasher;
 use std::{cmp::Ordering, collections::HashMap, path::PathBuf};
@@ -191,9 +191,8 @@ fn emit_reexport(
         ImportOrGlob::Glob(import) => (import.use_, import.idx),
         ImportOrGlob::Import(import) => (import.use_, import.idx),
     };
-    let def_db = db.upcast();
-    let loc = use_.lookup(def_db);
-    let use_ = &loc.id.item_tree(def_db)[loc.id.value];
+    let loc = use_.lookup(db);
+    let use_ = &loc.id.item_tree(db)[loc.id.value];
 
     use_.use_tree.expand(|id, path, kind, alias| {
         if id == idx {
@@ -368,7 +367,7 @@ fn emit_const(
         id: trap::TrapId::Star,
         text: Some(name.to_owned()),
     }));
-    let konst = db.const_data(konst);
+    let konst = db.const_signature(konst);
     let visibility = emit_visibility(db, trap, visibility);
     items.push(
         trap.emit(generated::Const {
@@ -400,7 +399,7 @@ fn emit_static(
         id: trap::TrapId::Star,
         text: Some(name.to_owned()),
     }));
-    let statik = db.static_data(statik);
+    let statik = db.static_signature(statik);
     let visibility = emit_visibility(db, trap, visibility);
     items.push(
         trap.emit(generated::Static {
@@ -412,7 +411,7 @@ fn emit_static(
             visibility,
             is_mut: statik.flags.contains(StaticFlags::MUTABLE),
             is_static: true,
-            is_unsafe: statik.flags.contains(StaticFlags::HAS_UNSAFE_KW),
+            is_unsafe: statik.flags.contains(StaticFlags::UNSAFE),
         })
         .into(),
     );
@@ -447,7 +446,7 @@ fn emit_adt(
                 id: trap::TrapId::Star,
                 text: Some(name.to_owned()),
             }));
-            let field_list = emit_variant_data(trap, db, struct_id.into()).into();
+            let field_list = emit_variant_signature(trap, db, struct_id.into()).into();
             let visibility = emit_visibility(db, trap, visibility);
             items.push(
                 trap.emit(generated::Struct {
@@ -472,7 +471,7 @@ fn emit_adt(
                         id: trap::TrapId::Star,
                         text: Some(name.as_str().to_owned()),
                     }));
-                    let field_list = emit_variant_data(trap, db, (*enum_id).into()).into();
+                    let field_list = emit_variant_signature(trap, db, (*enum_id).into()).into();
                     let visibility = None;
                     trap.emit(generated::Variant {
                         id: trap::TrapId::Star,
@@ -511,7 +510,7 @@ fn emit_adt(
                 id: trap::TrapId::Star,
                 text: Some(name.to_owned()),
             }));
-            let struct_field_list = emit_variant_data(trap, db, union_id.into()).into();
+            let struct_field_list = emit_variant_signature(trap, db, union_id.into()).into();
             let visibility = emit_visibility(db, trap, visibility);
             items.push(
                 trap.emit(generated::Union {
@@ -639,11 +638,11 @@ fn emit_module_impls(
     module.scope.impls().for_each(|imp| {
         let self_ty = db.impl_self_ty(imp);
         let self_ty = emit_hir_ty(trap, db, self_ty.skip_binders());
-        let imp_data = db.impl_data(imp);
-        let trait_ = imp_data
+        let imp_signature = db.impl_signature(imp);
+        let trait_ = imp_signature
             .target_trait
             .as_ref()
-            .and_then(|t| make_qualified_path(trap, emit_hir_path(&imp_data.types_map[t.path])));
+            .and_then(|t| make_qualified_path(trap, emit_hir_path(&imp_signature.store[t.path])));
         let trait_ = trait_.map(|trait_| {
             trap.emit(generated::PathTypeRepr {
                 id: trap::TrapId::Star,
@@ -689,13 +688,7 @@ fn emit_module_impls(
                         id: trap::TrapId::Star,
                         text: Some(name.as_str().to_owned()),
                     }));
-                    let data = db.function_data(*function);
-                    let visibility = emit_visibility(
-                        db,
-                        trap,
-                        data.visibility
-                            .resolve(db.upcast(), &function.resolver(db.upcast())),
-                    );
+                    let visibility = emit_visibility(db, trap, db.function_visibility(*function));
 
                     Some(
                         trap.emit(generated::Function {
@@ -754,7 +747,7 @@ fn emit_visibility(
 ) -> Option<trap::Label<generated::Visibility>> {
     let path = match visibility {
         Visibility::Module(module_id, VisibilityExplicitness::Explicit) => {
-            Some(make_path_mod(db.upcast(), module_id))
+            Some(make_path_mod(db, module_id))
         }
         Visibility::Public => Some(vec![]),
         Visibility::Module(_, VisibilityExplicitness::Implicit) => None,
@@ -862,7 +855,7 @@ fn emit_hir_type_bound(
         WhereClause::Implemented(trait_ref) => {
             let mut path = make_path(db, trait_ref.hir_trait_id());
             path.push(
-                db.trait_data(trait_ref.hir_trait_id())
+                db.trait_signature(trait_ref.hir_trait_id())
                     .name
                     .as_str()
                     .to_owned(),
@@ -888,7 +881,7 @@ fn emit_hir_type_bound(
     }
 }
 
-fn emit_hir_path(path: &ra_ap_hir_def::path::Path) -> Vec<String> {
+fn emit_hir_path(path: &ra_ap_hir_def::expr_store::path::Path) -> Vec<String> {
     path.segments()
         .iter()
         .map(|x| x.name.as_str().to_owned())
@@ -963,7 +956,7 @@ fn scalar_to_str(scalar: &Scalar) -> &'static str {
 }
 
 fn make_path(db: &dyn HirDatabase, item: impl HasModule) -> Vec<String> {
-    let db = db.upcast();
+    let db = db;
     let module = item.module(db);
     make_path_mod(db, module)
 }
@@ -1114,13 +1107,13 @@ fn emit_hir_ty(
             let mut path = make_path(db, adt_id.0);
             let name = match adt_id.0 {
                 ra_ap_hir_def::AdtId::StructId(struct_id) => {
-                    db.struct_data(struct_id).name.as_str().to_owned()
+                    db.struct_signature(struct_id).name.as_str().to_owned()
                 }
                 ra_ap_hir_def::AdtId::UnionId(union_id) => {
-                    db.union_data(union_id).name.as_str().to_owned()
+                    db.union_signature(union_id).name.as_str().to_owned()
                 }
                 ra_ap_hir_def::AdtId::EnumId(enum_id) => {
-                    db.enum_data(enum_id).name.as_str().to_owned()
+                    db.enum_signature(enum_id).name.as_str().to_owned()
                 }
             };
             path.push(name);
@@ -1208,7 +1201,7 @@ fn emit_hir_ty(
             let assoc_ty_data = db.associated_ty_data(from_assoc_type_id(*associated_ty_id));
 
             let _name = db
-                .type_alias_data(assoc_ty_data.name)
+                .type_alias_signature(assoc_ty_data.name)
                 .name
                 .as_str()
                 .to_owned();
@@ -1219,7 +1212,7 @@ fn emit_hir_ty(
             };
             let mut trait_path = make_path(db, trait_ref.hir_trait_id());
             trait_path.push(
-                db.trait_data(trait_ref.hir_trait_id())
+                db.trait_signature(trait_ref.hir_trait_id())
                     .name
                     .as_str()
                     .to_owned(),
@@ -1281,28 +1274,28 @@ impl From<Variant> for Option<trap::Label<generated::FieldList>> {
     }
 }
 
-fn emit_variant_data(trap: &mut TrapFile, db: &dyn HirDatabase, variant_id: VariantId) -> Variant {
-    let variant = variant_id.variant_data(db.upcast());
-    match variant.as_ref() {
-        VariantData::Record {
-            fields: field_data,
-            types_map: _,
-        } => {
-            let field_types = db.field_types(variant_id);
-            let fields = field_types
+fn emit_variant_signature(
+    trap: &mut TrapFile,
+    db: &dyn HirDatabase,
+    variant_id: VariantId,
+) -> Variant {
+    let variant = variant_id.variant_data(db);
+    let field_types = db.field_types(variant_id);
+    match variant.shape {
+        FieldsShape::Record => {
+            let fields = variant
+                .fields()
                 .iter()
-                .map(|(field_id, ty)| {
+                .map(|(field_id, data)| {
                     let name = Some(trap.emit(generated::Name {
                         id: trap::TrapId::Star,
-                        text: Some(field_data[field_id].name.as_str().to_owned()),
+                        text: Some(data.name.as_str().to_owned()),
                     }));
-                    let type_repr = emit_hir_ty(trap, db, ty.skip_binders());
+                    let type_repr = emit_hir_ty(trap, db, field_types[field_id].skip_binders());
                     let visibility = emit_visibility(
                         db,
                         trap,
-                        field_data[field_id]
-                            .visibility
-                            .resolve(db.upcast(), &variant_id.resolver(db.upcast())),
+                        Visibility::resolve(db, &variant_id.resolver(db), &data.visibility),
                     );
                     trap.emit(generated::StructField {
                         id: trap::TrapId::Star,
@@ -1320,20 +1313,16 @@ fn emit_variant_data(trap: &mut TrapFile, db: &dyn HirDatabase, variant_id: Vari
                 fields,
             }))
         }
-        VariantData::Tuple {
-            fields: field_data, ..
-        } => {
-            let field_types = db.field_types(variant_id);
-            let fields = field_types
+        FieldsShape::Tuple => {
+            let fields = variant
+                .fields()
                 .iter()
-                .map(|(field_id, ty)| {
-                    let type_repr = emit_hir_ty(trap, db, ty.skip_binders());
+                .map(|(field_id, data)| {
+                    let type_repr = emit_hir_ty(trap, db, field_types[field_id].skip_binders());
                     let visibility = emit_visibility(
                         db,
                         trap,
-                        field_data[field_id]
-                            .visibility
-                            .resolve(db.upcast(), &variant_id.resolver(db.upcast())),
+                        Visibility::resolve(db, &variant_id.resolver(db), &data.visibility),
                     );
 
                     trap.emit(generated::TupleField {
@@ -1349,7 +1338,7 @@ fn emit_variant_data(trap: &mut TrapFile, db: &dyn HirDatabase, variant_id: Vari
                 fields,
             }))
         }
-        VariantData::Unit => Variant::Unit,
+        FieldsShape::Unit => Variant::Unit,
     }
 }
 
